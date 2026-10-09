@@ -1,41 +1,45 @@
 pipeline {
     agent any
 
+    options {
+        skipDefaultCheckout(true)
+    }
+
     parameters {
         choice(
             name: 'ENVIRONMENT',
             choices: ['dev', 'stage', 'uat', 'prod'],
-            description: 'Select the environment to update'
+            description: 'Choose the environment'
         )
 
         choice(
             name: 'CONFIG_TYPE',
-            choices: ['both', 'environment', 'node'],
-            description: 'Select which configuration to process'
+            choices: ['node', 'both'],
+            description: 'Update node JSON; both also validates environment JSON'
         )
 
         string(
             name: 'INSTANCE_TYPE',
-            defaultValue: 't3.medium',
-            description: 'EC2 instance type'
+            defaultValue: '',
+            description: 'Optional: instance type; blank keeps current value'
         )
 
         string(
             name: 'K8S_VERSION',
-            defaultValue: '1.30',
-            description: 'Kubernetes version'
+            defaultValue: '',
+            description: 'Optional: Kubernetes version; blank keeps current value'
         )
 
         string(
             name: 'CPU',
-            defaultValue: '500m',
-            description: 'CPU resource value'
+            defaultValue: '',
+            description: 'Optional: CPU; blank keeps current value'
         )
 
         string(
             name: 'MEMORY',
-            defaultValue: '512Mi',
-            description: 'Memory resource value'
+            defaultValue: '',
+            description: 'Optional: memory; blank keeps current value'
         )
     }
 
@@ -54,7 +58,9 @@ pipeline {
                     url: "${GIT_REPO}"
 
                 sh '''
+                    echo "Current branch:"
                     git branch --show-current
+                    echo "Latest commit:"
                     git log -1 --oneline
                 '''
             }
@@ -63,83 +69,99 @@ pipeline {
         stage('Validate Configuration Files') {
             steps {
                 script {
-                    def envFile = "environment/${params.ENVIRONMENT}.json"
                     def nodeFile = "node/${params.ENVIRONMENT}.json"
+                    def envFile = "environment/${params.ENVIRONMENT}.json"
 
-                    if (params.CONFIG_TYPE in ['both', 'environment']) {
+                    if (!fileExists(nodeFile)) {
+                        error("Node JSON file not found: ${nodeFile}")
+                    }
+
+                    readJSON file: nodeFile
+                    echo "Node JSON is valid: ${nodeFile}"
+
+                    if (params.CONFIG_TYPE == 'both') {
                         if (!fileExists(envFile)) {
-                            error("Environment file not found: ${envFile}")
+                            error("Environment JSON file not found: ${envFile}")
                         }
 
                         readJSON file: envFile
                         echo "Environment JSON is valid: ${envFile}"
-                    }
-
-                    if (params.CONFIG_TYPE in ['both', 'node']) {
-                        if (!fileExists(nodeFile)) {
-                            error("Node file not found: ${nodeFile}")
-                        }
-
-                        readJSON file: nodeFile
-                        echo "Node JSON is valid: ${nodeFile}"
                     }
                 }
             }
         }
 
         stage('Update Node Configuration') {
-            when {
-                expression {
-                    params.CONFIG_TYPE in ['both', 'node']
-                }
-            }
-
             steps {
                 script {
                     def nodeFile = "node/${params.ENVIRONMENT}.json"
                     def nodeData = readJSON file: nodeFile
+                    boolean updated = false
 
-                    nodeData.instanceType = params.INSTANCE_TYPE
-
-                    if (nodeData.kubernetes instanceof Map) {
-                        nodeData.kubernetes.version = params.K8S_VERSION
-                    } else {
-                        error("Expected a 'kubernetes' object in ${nodeFile}")
+                    if (!(nodeData instanceof Map)) {
+                        error("Expected a JSON object in ${nodeFile}")
                     }
 
-                    if (nodeData.resources instanceof Map) {
-                        nodeData.resources.cpu = params.CPU
-                        nodeData.resources.memory = params.MEMORY
-                    } else {
-                        error("Expected a 'resources' object in ${nodeFile}")
+                    if (params.INSTANCE_TYPE?.trim()) {
+                        nodeData.instanceType = params.INSTANCE_TYPE.trim()
+                        updated = true
+                    }
+
+                    if (params.K8S_VERSION?.trim()) {
+                        if (!(nodeData.kubernetes instanceof Map)) {
+                            error("Missing kubernetes object in ${nodeFile}")
+                        }
+
+                        nodeData.kubernetes.version = params.K8S_VERSION.trim()
+                        updated = true
+                    }
+
+                    if (params.CPU?.trim()) {
+                        if (!(nodeData.resources instanceof Map)) {
+                            error("Missing resources object in ${nodeFile}")
+                        }
+
+                        nodeData.resources.cpu = params.CPU.trim()
+                        updated = true
+                    }
+
+                    if (params.MEMORY?.trim()) {
+                        if (!(nodeData.resources instanceof Map)) {
+                            error("Missing resources object in ${nodeFile}")
+                        }
+
+                        nodeData.resources.memory = params.MEMORY.trim()
+                        updated = true
+                    }
+
+                    if (!updated) {
+                        error('All inputs are blank. Enter at least one value to update.')
                     }
 
                     writeJSON file: nodeFile,
                         json: nodeData,
                         pretty: 4
 
-                    echo "Updated node configuration: ${nodeFile}"
+                    echo "Updated file: ${nodeFile}"
                 }
             }
         }
 
-        stage('Verify Configuration') {
+        stage('Verify Updated JSON') {
             steps {
                 script {
-                    if (params.CONFIG_TYPE in ['both', 'environment']) {
+                    def nodeFile = "node/${params.ENVIRONMENT}.json"
+                    def nodeData = readJSON file: nodeFile
+
+                    echo "Updated node configuration:"
+                    echo groovy.json.JsonOutput.prettyPrint(
+                        groovy.json.JsonOutput.toJson(nodeData)
+                    )
+
+                    if (params.CONFIG_TYPE == 'both') {
                         def envFile = "environment/${params.ENVIRONMENT}.json"
                         readJSON file: envFile
-                        echo "Verified: ${envFile}"
-                    }
-
-                    if (params.CONFIG_TYPE in ['both', 'node']) {
-                        def nodeFile = "node/${params.ENVIRONMENT}.json"
-                        def nodeData = readJSON file: nodeFile
-
-                        echo "Instance type: ${nodeData.instanceType}"
-                        echo "Kubernetes version: ${nodeData.kubernetes.version}"
-                        echo "CPU: ${nodeData.resources.cpu}"
-                        echo "Memory: ${nodeData.resources.memory}"
+                        echo "Environment JSON validation passed."
                     }
                 }
             }
@@ -160,36 +182,48 @@ pipeline {
 
                     git switch -c "$FEATURE_BRANCH"
 
-                    git add environment/*.json node/*.json
+                    git add -- "node/${ENVIRONMENT}.json"
 
                     if git diff --cached --quiet; then
-                        echo "No configuration changes to commit."
+                        echo "No changes detected. The entered values may already exist."
                         exit 1
                     fi
 
-                    git commit -m "Update ${ENVIRONMENT} configuration"
+                    git commit -m "Update ${ENVIRONMENT} node configuration"
                 '''
             }
         }
 
         stage('Push Feature Branch') {
             steps {
-                script {
-                    withCredentials([
-                        usernamePassword(
-                            credentialsId: env.GIT_CREDENTIALS_ID,
-                            usernameVariable: 'GITHUB_USER',
-                            passwordVariable: 'GITHUB_TOKEN'
-                        )
-                    ]) {
-                        sh '''
-                            set -eu
+                withCredentials([
+                    usernamePassword(
+                        credentialsId: 'Git-Flipkart',
+                        usernameVariable: 'GITHUB_USER',
+                        passwordVariable: 'GITHUB_TOKEN'
+                    )
+                ]) {
+                    sh '''
+                        set -eu
+                        set +x
 
-                            git -c credential.helper= \
-                                -c credential.helper='!f() { echo username=$GITHUB_USER; echo password=$GITHUB_TOKEN; }; f' \
-                                push origin "$FEATURE_BRANCH"
-                        '''
-                    }
+                        ASKPASS="$(mktemp)"
+                        trap 'rm -f "$ASKPASS"' EXIT
+
+                        cat > "$ASKPASS" <<'EOF'
+#!/bin/sh
+case "$1" in
+    *Username*) printf '%s\\n' "$GITHUB_USER" ;;
+    *Password*) printf '%s\\n' "$GITHUB_TOKEN" ;;
+esac
+EOF
+
+                        chmod 700 "$ASKPASS"
+
+                        GIT_ASKPASS="$ASKPASS" \
+                        GIT_TERMINAL_PROMPT=0 \
+                        git push origin "$FEATURE_BRANCH"
+                    '''
                 }
             }
         }
@@ -204,6 +238,9 @@ pipeline {
                     )
                 ]) {
                     sh '''
+                        set -eu
+                        set +x
+
                         python3 - <<'PY'
 import json
 import os
@@ -216,10 +253,10 @@ base = os.environ["BASE_BRANCH"]
 token = os.environ["GITHUB_TOKEN"]
 
 payload = {
-    "title": f"Update configuration: {branch}",
+    "title": f"Update {os.environ['ENVIRONMENT']} configuration",
     "head": branch,
     "base": base,
-    "body": "Automated configuration update by Jenkins."
+    "body": "Configuration update created by Jenkins."
 }
 
 request = urllib.request.Request(
@@ -236,11 +273,12 @@ request = urllib.request.Request(
 try:
     with urllib.request.urlopen(request) as response:
         result = json.loads(response.read().decode("utf-8"))
-        print("Pull request created:", result["html_url"])
+        print("Pull request created successfully.")
+        print("URL:", result["html_url"])
 except urllib.error.HTTPError as error:
     details = error.read().decode("utf-8")
     raise SystemExit(
-        f"GitHub API error {error.code}: {details}"
+        f"GitHub API returned {error.code}: {details}"
     )
 PY
                     '''
@@ -251,12 +289,11 @@ PY
 
     post {
         success {
-            echo 'Pipeline completed successfully.'
-            echo 'Check your GitHub repository for the pull request.'
+            echo 'SUCCESS: Changes pushed and pull request created.'
         }
 
         failure {
-            echo 'Pipeline failed. Check the Jenkins console output.'
+            echo 'FAILED: Check Console Output for the first error.'
         }
 
         always {
